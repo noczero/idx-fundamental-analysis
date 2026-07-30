@@ -1,19 +1,24 @@
 import base64
 import json
-import logging
 import os
 import re
-import subprocess
 import tempfile
 
-import undetected_chromedriver as uc
+from camoufox.sync_api import Camoufox
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
 from utils.logger_config import logger
 
 # A JWT is three base64url segments separated by dots; Stockbit access and
 # refresh tokens both start with "eyJ" (base64 of '{"').
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
 
-# Stockbit endpoints that carry the *refresh* token in their Authorization header.
+# Host that serves Stockbit's authenticated API. Every logged-in API call carries
+# the *access* token in its Authorization header, so matching on the host (rather
+# than one hardcoded path) is robust to Stockbit changing individual endpoints.
+_API_HOST_HINT = "exodus.stockbit.com"
+
+# Endpoint that carries the *refresh* token in its Authorization header.
 _REFRESH_ENDPOINT_HINT = "login/refresh"
 
 
@@ -38,82 +43,58 @@ def _jwt_lifetime(token):
     return -1
 
 
-def _detect_chrome_major_version():
-    """
-    Return the major version of the locally installed Chrome, or None if it
-    cannot be determined.
+def _looks_like_stockbit_jwt(claims):
+    """True if the decoded JWT claims look like a Stockbit-issued token."""
+    if (claims or {}).get("iss") == "STOCKBIT":
+        return True
+    data = (claims or {}).get("data") or {}
+    return "uid" in data
 
-    undetected-chromedriver otherwise downloads the *latest* ChromeDriver, which
-    fails with SessionNotCreatedException when it does not match the installed
-    Chrome (e.g. driver for Chrome 151 vs. an installed Chrome 150).
-    """
-    try:
-        chrome_path = uc.find_chrome_executable()
-        if not chrome_path:
-            return None
-        output = subprocess.check_output(
-            [chrome_path, "--version"],
-            text=True,
-            stderr=subprocess.STDOUT,
-        )
-        match = re.search(r"(\d+)\.\d+\.\d+", output)
-        if match:
-            return int(match.group(1))
-    except Exception:
-        return None
-    return None
 
-# Suppress noisy logs
-for _name in (
-    "selenium",
-    "selenium.webdriver",
-    "selenium.webdriver.remote.remote_connection",
-    "urllib3",
-):
-    logging.getLogger(_name).setLevel(logging.WARNING)
+def _is_refresh_claims(claims):
+    """True if the decoded JWT is a Stockbit *refresh* token."""
+    return ((claims or {}).get("data") or {}).get("typ") == "refresh"
+
+
+# JS that snapshots the whole of window.localStorage into a plain object. Used
+# to find tokens Stockbit persisted client-side.
+_LOCAL_STORAGE_SNAPSHOT_JS = """
+() => {
+  const o = {};
+  for (let i = 0; i < window.localStorage.length; i++) {
+    const k = window.localStorage.key(i);
+    o[k] = window.localStorage.getItem(k);
+  }
+  return o;
+}
+"""
 
 
 class StockbitTokenFetcher:
+    """
+    Interactive Stockbit login driven by Camoufox (a stealth Firefox fork on top
+    of Playwright), used to capture the access token, refresh token and browser
+    User-Agent for later browser-free renewal on a server.
+
+    Camoufox replaces the previous undetected-chromedriver/Selenium stack: the
+    Firefox-based, anti-fingerprinting engine is far less likely to be blocked,
+    and there is no Chrome/ChromeDriver version matching to worry about.
+
+    Tokens are captured from two independent sources for robustness:
+      1. The Authorization header of authenticated API calls (network capture).
+      2. Client-side storage (localStorage/cookies) read after login.
+    """
+
     def __init__(self):
         self.login_url = "https://stockbit.com/login"
-        self.sample_url = "exodus.stockbit.com/chat/v2/rooms/unread/count"
 
-        profile_dir = os.path.join(
-            os.path.expanduser("~"), ".idx-fundamental-stockbit-profile"
+        # Persistent Camoufox (Firefox) profile so a prior login is remembered
+        # across runs. Kept separate from the old Chrome profile dir since the
+        # on-disk profile formats differ.
+        self.profile_dir = os.path.join(
+            os.path.expanduser("~"), ".idx-fundamental-stockbit-camoufox"
         )
-        os.makedirs(profile_dir, exist_ok=True)
-
-        options = uc.ChromeOptions()
-        options.add_argument(f"--user-data-dir={profile_dir}")
-        # options.add_argument(f"--disk-cache-dir={cache_dir}") # UC handles profile better without explicit cache dir split sometimes, but keeping user-data-dir is key.
-
-        # Enable performance logging to capture headers
-        options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-
-        # Initialize undetected-chromedriver
-        # headless=False is important for manual login
-        # Pin the driver to the installed Chrome major version so uc downloads a
-        # matching ChromeDriver instead of the latest, avoiding
-        # SessionNotCreatedException on version mismatch.
-        chrome_version = _detect_chrome_major_version()
-        if chrome_version is not None:
-            logger.info(f"Detected installed Chrome major version: {chrome_version}")
-
-        # uc.Chrome() blocks while it downloads/patches a matching ChromeDriver
-        # and launches the browser; on a first run this can take tens of seconds
-        # with no output, which looks like a hang. Log before and after so it is
-        # clear the process is working, not stuck.
-        logger.info(
-            "Launching Chrome for interactive login (first run may take a while "
-            "to download the matching ChromeDriver)..."
-        )
-        self.driver = uc.Chrome(
-            options=options,
-            headless=False,
-            use_subprocess=True,
-            version_main=chrome_version,
-        )
-        logger.info("Chrome launched. A browser window should now be open.")
+        os.makedirs(self.profile_dir, exist_ok=True)
 
         # Keep the fetcher's own token dump in the same place StockbitApiClient
         # reads/writes tokens, so we don't leave a stray copy in the system temp
@@ -124,105 +105,130 @@ class StockbitTokenFetcher:
         self.token_path = os.path.join(tmp_dir, "stockbit_token.tmp")
 
     def fetch_tokens(self):
-        driver = self.driver
-        logger.info("Navigating to Stockbit login page...")
-        driver.get(self.login_url)
+        """
+        Open a real browser, let the user log in to Stockbit, and capture the
+        access token, refresh token and User-Agent.
 
-        logger.info("Please log in to Stockbit in the opened browser.")
-        input("Press Enter here AFTER login succeeds and the dashboard loads... ")
+        Returns:
+            (access_token, refresh_token, user_agent), any of which may be None
+            if capture failed.
+        """
+        # Latest Bearer tokens seen on the wire, updated by the request handler.
+        captured = {"access": None, "refresh_from_network": None}
 
-        # Scan performance logs for the sample request
-        logs = driver.get_log("performance")
+        def on_request(request):
+            # Playwright lower-cases header names.
+            auth_header = request.headers.get("authorization")
+            if not (auth_header and auth_header.startswith("Bearer ")):
+                return
+            bearer = auth_header.split(" ", 1)[1]
+            url = request.url
+            if _REFRESH_ENDPOINT_HINT in url:
+                # A call to login/refresh carries the refresh token itself.
+                captured["refresh_from_network"] = bearer
+            elif _API_HOST_HINT in url:
+                # Any authenticated API call carries the access token. Keep the
+                # LATEST one seen.
+                captured["access"] = bearer
 
-        access_token = None
-        refresh_from_network = None
+        logger.info(
+            "Launching Camoufox (stealth Firefox) for interactive login; the "
+            "first run downloads the browser and may take a while..."
+        )
 
-        # We look for Network.requestWillBeSent events
-        for entry in logs:
+        # persistent_context=True yields a Playwright BrowserContext (not a
+        # Browser) backed by the on-disk profile.
+        with Camoufox(
+            headless=False,
+            persistent_context=True,
+            user_data_dir=self.profile_dir,
+            humanize=True,
+            geoip=True,
+        ) as context:
+            # Catch requests from every page/popup in the context.
+            context.on("request", on_request)
+
+            page = context.pages[0] if context.pages else context.new_page()
+
+            logger.info("Navigating to Stockbit login page...")
+            page.goto(self.login_url, wait_until="domcontentloaded")
+
+            logger.info("A browser window is open. Please log in to Stockbit.")
+            input("Press Enter here AFTER login succeeds and the dashboard loads... ")
+
+            # Playwright's sync event loop is NOT pumped while we block on
+            # input(), so Bearer tokens sent during login were likely never
+            # dispatched to on_request. Reload the dashboard to re-issue
+            # authenticated API calls while we actively drive Playwright (which
+            # dispatches the request events), then also read tokens straight from
+            # client-side storage as a fallback.
+            logger.info("Reloading to capture the authenticated session token...")
             try:
-                message = json.loads(entry["message"])
-                method = message.get("message", {}).get("method")
-                if method == "Network.requestWillBeSent":
-                    params = message["message"]["params"]
-                    request = params.get("request", {})
-                    url = request.get("url", "")
+                # wait_until="commit" resolves as soon as the navigation response
+                # starts, so a dashboard with long-lived/streaming requests can't
+                # hang the reload (unlike "load"/"networkidle"). The subsequent
+                # wait_for_timeout pumps the event loop while deferred XHRs fire
+                # and are captured by on_request.
+                page.reload(wait_until="commit", timeout=8000)
+            except PlaywrightTimeoutError:
+                logger.warning("Reload timed out; relying on stored tokens.")
+            except Exception as e:
+                logger.warning(
+                    f"Reload after login failed ({e}); relying on stored tokens."
+                )
+            try:
+                page.wait_for_timeout(2500)
+            except Exception:
+                pass
 
-                    headers = request.get("headers", {})
-                    # Headers keys can be case-sensitive or not depending on browser version, usually title-cased or lowercase.
-                    # We check both.
-                    auth_header = headers.get("Authorization") or headers.get(
-                        "authorization"
-                    )
+            storage_access, storage_refresh = self._extract_tokens_from_storage(
+                page, context
+            )
 
-                    if not (auth_header and auth_header.startswith("Bearer ")):
-                        continue
+            access_token = captured["access"] or storage_access
+            refresh_token = captured["refresh_from_network"] or storage_refresh
 
-                    bearer = auth_header.split(" ", 1)[1]
-
-                    if self.sample_url in url:
-                        access_token = bearer
-                        # Don't break, keep looking for the LATEST token in the logs
-                    elif _REFRESH_ENDPOINT_HINT in url:
-                        # A call to login/refresh carries the refresh token itself.
-                        refresh_from_network = bearer
-            except (KeyError, json.JSONDecodeError):
-                continue
+            # Capture the User-Agent the browser actually used, so the server
+            # sends the same UA alongside the token.
+            user_agent = page.evaluate("() => navigator.userAgent")
 
         if not access_token:
             logger.error(
-                "Could not find Bearer token in captured requests. Make sure the page finished loading."
+                "Could not capture an access token from the network or from "
+                "browser storage. Make sure the dashboard fully loaded (you are "
+                "logged in) before pressing Enter."
             )
             return None, None, None
 
-        # Capture the User-Agent used by the browser
-        user_agent = driver.execute_script("return navigator.userAgent;")
         logger.info(f"User-Agent captured: {user_agent}")
+        logger.info(
+            "Access token captured "
+            f"(via {'network' if captured['access'] else 'storage'})."
+        )
 
-        logger.info("Access token captured.")
-
-        refresh_token = self._extract_refresh_token(driver, access_token, refresh_from_network)
-        if refresh_token:
+        if refresh_token and refresh_token != access_token:
             logger.info(
                 f"Refresh token captured (lifetime ~{_jwt_lifetime(refresh_token) // 3600}h)."
             )
         else:
+            refresh_token = None
             logger.warning(
-                "No refresh token found in browser storage. The server will not be able "
-                "to renew the token on its own and will need periodic re-bootstrap."
+                "No refresh token found. The server will not be able to renew "
+                "the token on its own and will need periodic re-bootstrap."
             )
 
         with open(self.token_path, "w") as f:
             f.write(access_token)
-
         logger.info(f"Tokens written to: {self.token_path}")
 
         return access_token, refresh_token, user_agent
 
-    def _extract_refresh_token(self, driver, access_token, refresh_from_network=None):
-        """
-        Locate the Stockbit refresh token so the server can renew access tokens
-        without a browser.
+    def _collect_jwt_candidates(self, page, context):
+        """Collect every JWT found in localStorage and cookies: token -> source."""
+        candidates = {}
 
-        Priority:
-          1. A refresh token seen in a login/refresh request's Authorization header.
-          2. A JWT persisted in localStorage/cookies that is not the access token.
-             The refresh token outlives the 24h access token, so among candidates
-             we pick the one with the longest lifetime.
-        """
-        if refresh_from_network and refresh_from_network != access_token:
-            return refresh_from_network
-
-        candidates = {}  # token -> source label
         try:
-            local_storage = (
-                driver.execute_script(
-                    "var o={};"
-                    "for(var i=0;i<window.localStorage.length;i++)"
-                    "{var k=window.localStorage.key(i);o[k]=window.localStorage.getItem(k);}"
-                    "return o;"
-                )
-                or {}
-            )
+            local_storage = page.evaluate(_LOCAL_STORAGE_SNAPSHOT_JS) or {}
         except Exception:
             local_storage = {}
 
@@ -236,28 +242,77 @@ class StockbitTokenFetcher:
                 candidates.setdefault(match, f"localStorage[{key}]")
 
         try:
-            cookies = driver.get_cookies()
+            cookies = context.cookies()
         except Exception:
             cookies = []
         for cookie in cookies:
             for match in _JWT_RE.findall(cookie.get("value", "") or ""):
                 candidates.setdefault(match, f"cookie[{cookie.get('name')}]")
 
-        best = None  # (lifetime, token, source)
-        for token, source in candidates.items():
-            if token == access_token:
-                continue
-            lifetime = _jwt_lifetime(token)
-            if best is None or lifetime > best[0]:
-                best = (lifetime, token, source)
+        return candidates
 
-        if best is not None:
-            logger.info(f"Refresh token source: {best[2]}")
-            return best[1]
-        return None
+    def _extract_tokens_from_storage(self, page, context):
+        """
+        Read the Stockbit access and refresh tokens directly from client-side
+        storage (localStorage/cookies).
+
+        Among the JWTs found:
+          * the refresh token is the one flagged ``typ == "refresh"`` (or, failing
+            that, the longest-lived JWT) — it outlives the 24h access token;
+          * the access token is the freshest non-refresh Stockbit JWT.
+        Freshness is decided by ``iat`` so a stale token left in storage does not
+        win over the one just issued at login.
+
+        Returns:
+            (access_token, refresh_token), either of which may be None.
+        """
+        candidates = self._collect_jwt_candidates(page, context)
+
+        best_access = None  # (iat, token, source)
+        best_refresh = None  # (iat, token, source)
+        for token, source in candidates.items():
+            claims = _decode_jwt_claims(token) or {}
+            if not _looks_like_stockbit_jwt(claims):
+                continue
+            iat = claims.get("iat", -1)
+            try:
+                iat = int(iat)
+            except (TypeError, ValueError):
+                iat = -1
+            if _is_refresh_claims(claims):
+                if best_refresh is None or iat > best_refresh[0]:
+                    best_refresh = (iat, token, source)
+            else:
+                if best_access is None or iat > best_access[0]:
+                    best_access = (iat, token, source)
+
+        access = best_access[1] if best_access else None
+        refresh = best_refresh[1] if best_refresh else None
+
+        if best_access:
+            logger.info(f"Access token source (storage): {best_access[2]}")
+        if best_refresh:
+            logger.info(f"Refresh token source (storage): {best_refresh[2]}")
+
+        # Fallback: no token was explicitly flagged as a refresh token, so use
+        # the longest-lived JWT that is not the access token.
+        if refresh is None:
+            longest = None  # (lifetime, token)
+            for token in candidates:
+                if token == access:
+                    continue
+                lifetime = _jwt_lifetime(token)
+                if longest is None or lifetime > longest[0]:
+                    longest = (lifetime, token)
+            if longest is not None:
+                refresh = longest[1]
+
+        return access, refresh
 
     def close(self):
-        try:
-            self.driver.quit()
-        except Exception:
-            pass
+        """
+        Kept for API compatibility with the previous Selenium-based fetcher.
+        The browser lifetime is now scoped to the ``with Camoufox(...)`` block in
+        ``fetch_tokens``, so there is nothing to tear down here.
+        """
+        return None

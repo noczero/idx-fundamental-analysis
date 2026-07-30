@@ -5,21 +5,23 @@ IDX Class Documentation
 **Class Description**
 --------------------
 
-The `IDX` class is a provider for retrieving stock data from the IDX (Indonesian Stock Exchange) website.
-It uses Selenium WebDriver to interact with the website and extracts relevant data from the stock list page.
+The `IDX` class is a provider for retrieving stock data from the IDX (Indonesian
+Stock Exchange) website. It drives Camoufox — a stealth, anti-fingerprinting
+Firefox fork on top of Playwright — to load the stock-list page (which sits
+behind Cloudflare) and extract the table.
 
 **Class Methods**
 ----------------
 
 ### `__init__`
 
-*   Initializes the `IDX` provider with a Chrome WebDriver instance and sets the base URL for the IDX website.
-*   Logs a debug message indicating the provider has been initialized.
+*   Configures the provider: base URL, whether to retrieve all stocks or just a
+    small sample, and headless mode.
 
 ### `stocks`
 
 *   Retrieves a list of stock data from the IDX website.
-*   Returns a list of `Stock` objects, each containing the following attributes:
+*   Returns a list of `Stock` objects, each containing:
     + `ticker`: The stock ticker symbol.
     + `name`: The stock name.
     + `ipo_date`: The initial public offering date.
@@ -29,23 +31,63 @@ It uses Selenium WebDriver to interact with the website and extracts relevant da
 **Notes**
 ------
 
-*   The `stocks` method uses Selenium WebDriver to navigate to the IDX website, wait for the table to load,
-    and extract the relevant data.
-*   The method uses XPath expressions to locate the table elements and extract the data.
-
+*   `stocks` launches Camoufox, navigates to the IDX stock-list page, waits for
+    the table to render (detecting Cloudflare challenges), optionally expands the
+    page size to load every stock, and reads the rows in a single DOM pass.
 """
 
+import os
 import re
 
-from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as expect
-from selenium.webdriver.support.select import Select
-from selenium.webdriver.support.ui import WebDriverWait
+from camoufox.sync_api import Camoufox
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from schemas.stock import Stock
 from utils.logger_config import logger
+
+_TABLE_SELECTOR = "#vgt-table"
+_PER_PAGE_SELECT = "select[name='perPageSelect']"
+_NEXT_PAGE_BUTTON = "button.footer__navigation__page-btn:nth-child(4)"
+
+# Single DOM pass that reads every row of the stock table into a list of
+# objects. The table has 5 data columns (Kode, Nama, Tanggal Pencatatan, Saham,
+# Papan Pencatatan) but vue-good-table sometimes prepends an empty line-number
+# column, which intermittently shifts fixed nth-child positions by one. The data
+# columns are always the LAST 5 cells, so we slice from the end to stay aligned
+# regardless of whether the leading column is present. Rows without a ticker are
+# dropped as malformed.
+_EXTRACT_ROWS_JS = """
+() => {
+  const rows = Array.from(document.querySelectorAll('#vgt-table tbody tr'));
+  return rows.map(r => {
+    const tds = Array.from(r.querySelectorAll('td')).map(td => td.textContent.trim());
+    const data = tds.slice(-5);
+    return {
+      ticker: data[0] || '',
+      name: data[1] || '',
+      ipo_date: data[2] || '',
+      market_cap: data[3] || '',
+      note: data[4] || '',
+    };
+  }).filter(row => row.ticker);
+}
+"""
+
+
+def _resolve_headless():
+    """
+    Resolve the Camoufox headless mode from the IDX_HEADLESS env var.
+
+    * unset / "true" / "1"    -> True (headless)
+    * "virtual"               -> "virtual" (Xvfb virtual display; good on Linux
+                                  servers where a real display is absent but a
+                                  headless-detectable browser gets blocked)
+    * "false" / "0" / "no"    -> False (headed, shows a window)
+    """
+    val = os.environ.get("IDX_HEADLESS", "true").strip().lower()
+    if val == "virtual":
+        return "virtual"
+    return val not in ("0", "false", "no", "off")
 
 
 class IDX:
@@ -53,41 +95,22 @@ class IDX:
     IDX Provider Class
     """
 
-    def __init__(self, is_full_retrieve=True, is_second_page=False, driver=None):
+    def __init__(self, is_full_retrieve=True, is_second_page=False):
         """
-        Initializes the IDX provider with a Chrome WebDriver instance and sets the base URL for the IDX website.
+        Initializes the IDX provider and sets the base URL for the IDX website.
         """
         logger.info("IDX provider initialised")
         self.base_url = "https://idx.co.id"
         self.is_full_retrieve = is_full_retrieve
         self.is_second_page = is_second_page
+        self.timeout_ms = 15000
 
-        if driver is not None:
-            self.driver = driver
-            self._own_driver = False
-        else:
-            options = webdriver.ChromeOptions()
-            options.add_argument("--disable-blink-features=AutomationControlled")
-            options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            options.add_experimental_option("useAutomationExtension", False)
-            options.add_argument("start-maximized")
-            options.add_argument(
-                "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            )
-            self.driver = webdriver.Chrome(options=options)
-            self._own_driver = True
-
-        self.wait = WebDriverWait(self.driver, 15)
-
-    def _wait_for_table(self, url: str) -> None:
+    def _wait_for_table(self, page, url: str) -> None:
+        """Wait for the stock table, raising a clear error on a Cloudflare wall."""
         try:
-            self.wait.until(
-                expect.presence_of_element_located((By.XPATH, '//*[@id="vgt-table"]'))
-            )
-        except TimeoutException as exc:
-            page_source = self.driver.page_source.lower()
+            page.wait_for_selector(_TABLE_SELECTOR, timeout=self.timeout_ms)
+        except PlaywrightTimeoutError as exc:
+            page_source = page.content().lower()
             if "cloudflare" in page_source and (
                 "just a moment" in page_source or "checking your browser" in page_source
             ):
@@ -108,88 +131,71 @@ class IDX:
         """
         url = f"{self.base_url}/id/data-pasar/data-saham/daftar-saham/"
 
-        self.driver.get(url)
+        logger.info(
+            "Launching Camoufox to load the IDX stock list"
+        )
 
-        # Wait for initial table or detect Cloudflare challenge
-        self._wait_for_table(url)
+        with Camoufox(
+            headless=_resolve_headless(),
+            humanize=True,
+            geoip=True,
+        ) as browser:
+            page = browser.new_page()
 
-        # if true it will retrieve all stocks, otherwise 10 stocks only
-        if self.is_full_retrieve:
-            # Wait for the rows-per-page dropdown to be present
-            self.wait.until(
-                expect.presence_of_element_located((By.NAME, "perPageSelect"))
-            )
+            page.goto(url, wait_until="domcontentloaded")
 
-            # Find the dropdown
-            rows_per_page_dropdown = Select(
-                self.driver.find_element(By.NAME, "perPageSelect")
-            )
+            # Wait for initial table or detect a Cloudflare challenge.
+            self._wait_for_table(page, url)
 
-            # Select the option to retrieve all stocks
-            rows_per_page_dropdown.select_by_value("-1")
+            # If true retrieve all stocks, otherwise the default first page (~10).
+            if self.is_full_retrieve:
+                page.wait_for_selector(_PER_PAGE_SELECT, timeout=self.timeout_ms)
+                # value "-1" is the "All" option in the rows-per-page dropdown.
+                page.select_option(_PER_PAGE_SELECT, "-1")
+                self._wait_for_full_table(page, url)
 
-            # Wait for the full table to load after changing page size
-            self._wait_for_table(url)
+            if self.is_second_page:
+                # Page forward twice, matching the previous behaviour.
+                for _ in range(2):
+                    page.wait_for_selector(_PER_PAGE_SELECT, timeout=self.timeout_ms)
+                    page.click(_NEXT_PAGE_BUTTON)
+                    self._wait_for_table(page, url)
 
-        if self.is_second_page:
-            # go to second page
-            self.wait.until(
-                expect.presence_of_element_located((By.NAME, "perPageSelect"))
-            )
+            # Final settle in case the table is still re-rendering.
+            self._wait_for_table(page, url)
 
-            third_button = self.driver.find_element(
-                By.CSS_SELECTOR, "button.footer__navigation__page-btn:nth-child(4)"
-            )
+            rows = page.evaluate(_EXTRACT_ROWS_JS)
 
-            third_button.click()
-
-            # wait for table after navigating
-            self._wait_for_table(url)
-
-            # go to second page
-            self.wait.until(
-                expect.presence_of_element_located((By.NAME, "perPageSelect"))
-            )
-
-            third_button = self.driver.find_element(
-                By.CSS_SELECTOR, "button.footer__navigation__page-btn:nth-child(4)"
-            )
-
-            third_button.click()
-
-            # wait for table after navigating
-            self._wait_for_table(url)
-
-        # Wait for the table to update, adjust the time if necessary
-        self._wait_for_table(url)
-
-        # Find the table
-        table = self.driver.find_element(By.XPATH, '//*[@id="vgt-table"]')
-
-        # Parse tables by XPATH, the way to find XPATH is by inspect element
-        # This is the XPATH for first ticker: table/tbody/tr[1]/td[1]/span
-        # Select all row means no index for tr tag.
-        tickers = table.find_elements(By.XPATH, "./tbody/tr/td[1]/span")
-        names = table.find_elements(By.XPATH, "./tbody/tr/td[2]/span")
-        ipo_dates = table.find_elements(By.XPATH, "./tbody/tr/td[3]/span")
-        market_caps = table.find_elements(By.XPATH, "./tbody/tr/td[4]/span")
-        notes = table.find_elements(By.XPATH, "./tbody/tr/td[5]/span")
-
-        # Append data, use array of stock schema
+        logger.info(
+            "Load IDX page..."
+        )
+        
         stocks = []
-        for index in range(len(tickers)):
-            stock = Stock(
-                ticker=tickers[index].text,
-                name=names[index].text,
-                ipo_date=ipo_dates[index].text,
-                market_cap=float(re.sub(r"\D", "", market_caps[index].text)),
-                note=notes[index].text,
+        for row in rows:
+            digits = re.sub(r"\D", "", row.get("market_cap", ""))
+            stocks.append(
+                Stock(
+                    ticker=row.get("ticker", ""),
+                    name=row.get("name", ""),
+                    ipo_date=row.get("ipo_date", ""),
+                    market_cap=float(digits) if digits else 0.0,
+                    note=row.get("note", ""),
+                )
             )
-            stocks.append(stock)
-
-        # Close browser
-        if getattr(self, "_own_driver", True):
-            self.driver.quit()
 
         logger.info(f"Stocks has been retrieved from {url}")
         return stocks
+
+    def _wait_for_full_table(self, page, url: str) -> None:
+        """
+        After expanding the page size to "All", wait for the table to finish
+        re-rendering the full set of rows.
+        """
+        try:
+            page.wait_for_load_state("networkidle", timeout=self.timeout_ms)
+        except PlaywrightTimeoutError:
+            # Pure client-side re-renders may never go network-idle; fall through.
+            pass
+        self._wait_for_table(page, url)
+        # Small settle for the row list to stabilise after the size change.
+        page.wait_for_timeout(1500)

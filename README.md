@@ -4,14 +4,14 @@
 
 IDX Fundamental Analysis project aims to retrieve and analyse fundamental stock data of companies listed on the
 Indonesian
-Stock Exchange (IDX). It fetches stock data and key statistics using Selenium, requests, and various provider APIs, and
-stores the resultant data in Google Sheets or local Excel file for easy access and analysis.
+Stock Exchange (IDX). It fetches stock data and key statistics using Camoufox (a stealth Firefox browser), requests, and
+various provider APIs, and stores the resultant data in Google Sheets or local Excel file for easy access and analysis.
 
 https://github.com/user-attachments/assets/13395cf7-1e3e-4153-8d20-40d4755a4c6d
 
 ## Features
 
-- **Fetch Stock Data from IDX**: Use Selenium web driver to scrape stock data from IDX.
+- **Fetch Stock Data from IDX**: Use Camoufox (stealth Firefox) to scrape stock data from IDX past Cloudflare.
 - **Retrieve Fundamental Data**: Obtain key statistics and fundamental data using StockBit and YFinance API.
 - **Google Sheets Integration**: Create and update Google Sheets with stock data using Google Drive API. Required
   Google Service Account environment variable.
@@ -41,7 +41,19 @@ https://github.com/user-attachments/assets/13395cf7-1e3e-4153-8d20-40d4755a4c6d
    uv sync
    ```
 
-3. Set up environment variables:
+3. Download the Camoufox browser binary (a stealth Firefox fork used for
+   scraping IDX and the Stockbit login). This is a one-time download of the
+   browser + fingerprint data:
+
+   ```bash
+   uv run python -m camoufox fetch
+   ```
+
+   > On a headless Linux server you may also need Firefox's system libraries
+   > (e.g. `libgtk-3-0`, `libx11-xcb1`, `libasound2`). If the browser fails to
+   > start, install them via your package manager.
+
+4. Set up environment variables:
 
    Create a `.env` file in the project root directory and add the following environment variables:
 
@@ -87,9 +99,9 @@ and authorized access to Google Drive and possessed a valid username and passwor
 
 ## Stockbit authentication (local login + headless server)
 
-Stockbit access tokens are captured through a real browser login and are valid for **24 hours**. To run the analysis on
-a browser-less server, the login is done **once locally** and the server then renews tokens on its own using the
-**refresh token** — no browser required.
+Stockbit access tokens are captured through a real browser login (using Camoufox, a stealth Firefox fork) and are valid
+for **24 hours**. To run the analysis on a browser-less server, the login is done **once locally** and the server then
+renews tokens on its own using the **refresh token** — no browser required.
 
 ### Token files
 
@@ -106,9 +118,9 @@ Relevant environment variables:
 | Variable                          | Default        | Description                                                                                     |
 | --------------------------------- | -------------- | ----------------------------------------------------------------------------------------------- |
 | `STOCKBIT_TOKEN_DIR`              | system temp    | Persistent directory for the token files. Set this on a server where `/tmp` is wiped on reboot. |
-| `STOCKBIT_DISABLE_BROWSER_LOGIN` | *(unset)*      | Set to `1`/`true` on a headless server so the client renews only via refresh token, never Chrome. |
+| `STOCKBIT_DISABLE_BROWSER_LOGIN` | *(unset)*      | Set to `1`/`true` on a headless server so the client renews only via refresh token, never launching a browser. |
 
-### 1. Bootstrap locally (machine with Chrome)
+### 1. Bootstrap locally (machine with a display)
 
 ```bash
 # Set a stable dir so you know where the files land (optional; defaults to temp).
@@ -116,8 +128,8 @@ export STOCKBIT_TOKEN_DIR="$HOME/.idx-fundamental-tokens"
 uv run python main.py --stockbit-login
 ```
 
-A Chrome window opens. Log in to Stockbit, wait for the dashboard, then press Enter in the terminal. The command writes
-the three token files and prints their paths.
+A Camoufox (Firefox) window opens. Log in to Stockbit, wait for the dashboard, then press Enter in the terminal. The
+command writes the three token files and prints their paths.
 
 ### 2. Sync the token files to the server
 
@@ -125,7 +137,7 @@ the three token files and prints their paths.
 rsync -av "$HOME/.idx-fundamental-tokens/" user@your-vps:/var/lib/idx-fundamental/tokens/
 ```
 
-### 3. Run on the server (no Chrome)
+### 3. Run on the server (no interactive browser)
 
 ```bash
 export STOCKBIT_TOKEN_DIR=/var/lib/idx-fundamental/tokens
@@ -175,7 +187,7 @@ This project is licensed under the MIT License. See the [LICENSE](LICENSE) file 
 ## Acknowledgements
 
 - [Stockbit](https://stockbit.com) for IDX composite key statistics and stock prices data.
-- [Selenium](https://www.selenium.dev/) for web scraping capabilities.
+- [Camoufox](https://github.com/daijro/camoufox) for stealth browser scraping capabilities.
 - [Loguru](https://github.com/Delgan/loguru) for logging.
 - [yfinance](https://github.com/ranaroussi/yfinance) for financial data.
 - [Google APIs](https://developers.google.com/api-client-library/python/) for integration with Google Sheets.
