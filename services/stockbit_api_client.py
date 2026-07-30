@@ -321,11 +321,13 @@ class StockbitApiClient:
         :param user_agent: optional User-Agent to persist alongside the tokens
         :return:
         """
-        self._atomic_write(self.refresh_token_temp_file_path, refresh_token)
-        self._atomic_write(self.token_temp_file_path, token)
+        # Strip before persisting so a stray newline never reaches an HTTP header
+        # (http.client rejects header values containing "\n" / "\r").
+        self._atomic_write(self.refresh_token_temp_file_path, (refresh_token or "").strip())
+        self._atomic_write(self.token_temp_file_path, (token or "").strip())
 
         if user_agent:
-            self._atomic_write(self.ua_temp_file_path, user_agent)
+            self._atomic_write(self.ua_temp_file_path, user_agent.strip())
 
     @staticmethod
     def _atomic_write(path, content):
@@ -362,17 +364,22 @@ class StockbitApiClient:
 
         try:
             with open(self.ua_temp_file_path, "r") as file:
-                ua = file.read()
-                if ua != "":
+                # Strip: a stray trailing newline (e.g. from a synced/edited file)
+                # in an HTTP header value makes http.client raise
+                # "ValueError: Invalid header value".
+                ua = file.read().strip()
+                if ua:
                     self.headers["User-Agent"] = ua
         except FileNotFoundError:
             pass
 
         try:
             with open(self.token_temp_file_path, "r") as file:
-                token = file.read()
+                # Strip for the same reason as the User-Agent above: a token with
+                # a trailing "\n" produces an invalid "Bearer ...\n" header value.
+                token = file.read().strip()
                 logger.debug(f"Token: {token}")
-                if token != "":
+                if token:
                     self.headers["Authorization"] = f"Bearer {token}"
 
                 if self.auto_authenticate:
