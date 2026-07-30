@@ -8,6 +8,18 @@ from utils.logger_config import logger
 from services.stockbit_token_fetcher import StockbitTokenFetcher
 
 
+class StockbitReauthRequiredError(RuntimeError):
+    """
+    Raised when Stockbit authentication cannot be recovered without a local,
+    interactive re-bootstrap — i.e. the refresh token is dead/expired AND browser
+    login is disabled (STOCKBIT_DISABLE_BROWSER_LOGIN, the headless-server mode).
+
+    It is a hard-stop signal: retrying against every request is pointless, so the
+    caller should abort the run instead of logging the same error thousands of
+    times.
+    """
+
+
 class StockbitApiClient:
     """
     Handles HTTP requests to the Stockbit API, including authentication and retries.
@@ -164,14 +176,16 @@ class StockbitApiClient:
         is a hard error that requires re-running the local bootstrap.
         """
         if self.disable_browser_login:
-            logger.error(
-                "Browser login is disabled (STOCKBIT_DISABLE_BROWSER_LOGIN) and no valid "
-                "refresh token is available. Re-run the local bootstrap "
-                "(`uv run python main.py --stockbit-login`) on a machine with Chrome and "
-                f"sync the token files in {self.token_dir} to this host."
-            )
             self.is_authorise = False
-            return
+            # Hard stop: on a headless server there is no way to recover, so abort
+            # the whole run rather than repeat this for every request.
+            raise StockbitReauthRequiredError(
+                "Stockbit requires a local re-bootstrap: the refresh token is "
+                "invalid/expired and browser login is disabled "
+                "(STOCKBIT_DISABLE_BROWSER_LOGIN). Re-run "
+                "`uv run python main.py --stockbit-login` on a machine with a "
+                f"browser, then sync the token files in {self.token_dir} to this host."
+            )
 
         self.headers["Authorization"] = None
 

@@ -1,4 +1,5 @@
 import argparse
+import sys
 import time
 from datetime import date
 
@@ -10,7 +11,10 @@ from db import database
 from providers.idx import IDX
 from providers.stockbit import StockBit
 from schemas.builder import BuilderOutputType
-from services.stockbit_api_client import StockbitApiClient
+from services.stockbit_api_client import (
+    StockbitApiClient,
+    StockbitReauthRequiredError,
+)
 from utils.logger_config import logger
 
 load_dotenv()
@@ -99,4 +103,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except StockbitReauthRequiredError as e:
+        # Headless server with a dead refresh token and no browser login: stop
+        # immediately with an actionable message instead of failing every request.
+        logger.error(str(e))
+        logger.error("Aborting run — Stockbit re-authentication required.")
+        sys.exit(1)
