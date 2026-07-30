@@ -210,55 +210,129 @@ class StockbitApiClient:
 
     def _refresh_token(self):
         """
-        Refreshes new token using refresh token.
+        Renew the access token using the stored refresh token.
+
+        Outcomes are handled differently so a dead refresh token surfaces a
+        clear, actionable error instead of silently launching a browser login:
+
+        * 200          -> success; rotate and persist both tokens.
+        * 401 / 403    -> the refresh token itself is rejected. Stockbit revokes
+                          and rotates refresh tokens server-side, so a token can
+                          be dead even though its JWT ``exp`` is still in the
+                          future. Discard it (so we don't keep retrying a token
+                          that can never work) and re-authenticate via ``_login``
+                          (which honours STOCKBIT_DISABLE_BROWSER_LOGIN).
+        * other status -> treated as transient; keep the refresh token so a
+                          later retry can use it.
+        * network error-> transient; keep the refresh token.
         """
         url = "https://exodus.stockbit.com/login/refresh"
 
-        with open(self.refresh_token_temp_file_path, "r") as file:
-            self.headers["Authorization"] = f"Bearer {file.read()}"
+        try:
+            with open(self.refresh_token_temp_file_path, "r") as file:
+                refresh_token = file.read().strip()
+        except FileNotFoundError:
+            refresh_token = ""
 
+        if not refresh_token:
+            # Nothing to refresh with; fall back to (possibly disabled) login.
+            self._login()
+            return
+
+        self.headers["Authorization"] = f"Bearer {refresh_token}"
+
+        try:
+            response = requests.post(url, headers=self.headers)
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Token refresh request failed (transient): {e}")
+            self.is_authorise = False
+            return
+
+        if response.status_code == 200:
             try:
-                response = requests.post(url, headers=self.headers)
+                data = response.json()["data"]
+                token = data["access"]["token"]
+                new_refresh_token = data["refresh"]["token"]
+            except (KeyError, ValueError) as e:
+                logger.error(
+                    "Token refresh returned 200 but the response was malformed "
+                    f"({e}). Body: {response.text[:300]}"
+                )
+                self.is_authorise = False
+                return
 
-                if response.status_code == 200:
-                    logger.info("Token is successfully refreshed!")
+            logger.info("Token is successfully refreshed!")
+            self.headers["Authorization"] = f"Bearer {token}"
+            self._write_token(token, new_refresh_token)
+            self.is_authorise = True
+            time.sleep(1)
+            return
 
-                    token = response.json()["data"]["access"]["token"]
-                    refresh_token = response.json()["data"]["refresh"]["token"]
+        if response.status_code in (401, 403):
+            # Dead refresh token: rejected server-side regardless of its JWT exp.
+            logger.warning(
+                f"Stockbit rejected the refresh token (status "
+                f"{response.status_code}: {response.text[:200]}). It is invalid "
+                "or revoked server-side despite its JWT expiry; re-authenticating."
+            )
+            self._clear_refresh_token()
+            self._login()
+            return
 
-                    self.headers["Authorization"] = f"Bearer {token}"
-
-                    self._write_token(token, refresh_token)
-
-                    self.is_authorise = True
-                else:
-                    logger.error(
-                        f"Error: Received status code {response.status_code} - {response.text}"
-                    )
-                    self._login()
-
-                time.sleep(1)
-
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Request failed: {e}")
+        # Anything else (5xx, rate limiting, ...) is likely transient: keep the
+        # refresh token untouched so the next attempt can reuse it.
+        logger.error(
+            f"Unexpected status refreshing token: {response.status_code} - "
+            f"{response.text[:200]}. Keeping refresh token for a later retry."
+        )
+        self.is_authorise = False
 
     def _write_token(self, token, refresh_token, user_agent=None):
         """
-        Write tokens to temporary file.
-        :param token:
-        :param refresh_token:
-        :param user_agent:
+        Persist the tokens.
+
+        The refresh token is written BEFORE the access token on purpose.
+        Stockbit rotates (single-use) the refresh token on every successful
+        refresh, so a fresh access token paired with a stale/consumed refresh
+        token is the exact state that forces an interactive login on the next
+        run. Writing refresh-first means an interruption mid-write leaves
+        (new refresh + old access), which self-heals on the next refresh, rather
+        than (new access + dead refresh), which does not.
+
+        Each file is written atomically (temp file + ``os.replace``) so a reader
+        never observes a half-written or empty token file.
+
+        :param token: access token
+        :param refresh_token: refresh token (may be "")
+        :param user_agent: optional User-Agent to persist alongside the tokens
         :return:
         """
-        with open(self.token_temp_file_path, "w") as file:
-            file.write(token)
-
-        with open(self.refresh_token_temp_file_path, "w") as file:
-            file.write(refresh_token)
+        self._atomic_write(self.refresh_token_temp_file_path, refresh_token)
+        self._atomic_write(self.token_temp_file_path, token)
 
         if user_agent:
-            with open(self.ua_temp_file_path, "w") as file:
-                file.write(user_agent)
+            self._atomic_write(self.ua_temp_file_path, user_agent)
+
+    @staticmethod
+    def _atomic_write(path, content):
+        """
+        Write ``content`` to ``path`` atomically: write to a per-process temp
+        file, fsync it, then rename over the destination. Guarantees the target
+        is always either the complete old or complete new content.
+        """
+        tmp_path = f"{path}.{os.getpid()}.part"
+        with open(tmp_path, "w") as file:
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp_path, path)
+
+    def _clear_refresh_token(self):
+        """Blank out a dead refresh token so it is not retried on later runs."""
+        try:
+            self._atomic_write(self.refresh_token_temp_file_path, "")
+        except OSError as e:
+            logger.error(f"Failed to clear the refresh token file: {e}")
 
     def _initialize_token_file(self):
         """
@@ -299,11 +373,12 @@ class StockbitApiClient:
         :return: boolean
         """
         try:
-            with open(os.path.join(self.refresh_token_temp_file_path), "r") as file:
+            with open(self.refresh_token_temp_file_path, "r") as file:
                 token = file.read()
-                return token == ""
+                return token.strip() == ""
         except FileNotFoundError:
-            return False
+            # No file means there is no refresh token to use.
+            return True
 
     def _request_challenge(self):
         """

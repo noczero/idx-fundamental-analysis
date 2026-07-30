@@ -99,14 +99,28 @@ class StockbitTokenFetcher:
         if chrome_version is not None:
             logger.info(f"Detected installed Chrome major version: {chrome_version}")
 
+        # uc.Chrome() blocks while it downloads/patches a matching ChromeDriver
+        # and launches the browser; on a first run this can take tens of seconds
+        # with no output, which looks like a hang. Log before and after so it is
+        # clear the process is working, not stuck.
+        logger.info(
+            "Launching Chrome for interactive login (first run may take a while "
+            "to download the matching ChromeDriver)..."
+        )
         self.driver = uc.Chrome(
             options=options,
             headless=False,
             use_subprocess=True,
             version_main=chrome_version,
         )
+        logger.info("Chrome launched. A browser window should now be open.")
 
-        tmp_dir = tempfile.gettempdir()
+        # Keep the fetcher's own token dump in the same place StockbitApiClient
+        # reads/writes tokens, so we don't leave a stray copy in the system temp
+        # dir when STOCKBIT_TOKEN_DIR points elsewhere (e.g. a persistent path
+        # on a server where /tmp is wiped on reboot).
+        tmp_dir = os.environ.get("STOCKBIT_TOKEN_DIR") or tempfile.gettempdir()
+        os.makedirs(tmp_dir, exist_ok=True)
         self.token_path = os.path.join(tmp_dir, "stockbit_token.tmp")
 
     def fetch_tokens(self):
